@@ -9,6 +9,7 @@
     "node": ">=22.0.0"
   },
   "scripts": {
+    "tui": "node --import tsx src/cli/local-tui.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
@@ -36,23 +37,31 @@
     "prisma:migrate": "prisma migrate deploy",
     "prisma:migrate:dev": "prisma migrate dev",
     "prisma:studio": "prisma studio",
-    "prisma:validate": "prisma validate"
+    "prisma:validate": "prisma validate",
+    "dashboard:build": "tsc --noEmit -p dashboard/tsconfig.json && vite build --config dashboard/vite.config.ts",
+    "dashboard:start": "node dist/dashboard/index.js"
   },
   "dependencies": {
     "@prisma/client": "^6.16.0",
+    "cheerio": "^1.2.0",
     "dotenv": "^17.2.2",
     "node-cron": "^4.2.1",
     "pino": "^9.9.4",
     "playwright": "1.62.1",
     "prisma": "6.19.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^24.3.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitest/coverage-v8": "^3.2.7",
     "pino-pretty": "^13.1.1",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
+    "vite": "^7.3.7",
     "vitest": "^3.2.7"
   }
 }

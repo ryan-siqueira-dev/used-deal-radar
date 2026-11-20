@@ -6,6 +6,10 @@ export interface BrowserSessionOptions {
   executablePath?: string;
 }
 
+function isAlreadyClosed(error: unknown): boolean {
+  return error instanceof Error && /Target page, context or browser has been closed/.test(error.message);
+}
+
 export class BrowserSession {
   #browser: Browser | null = null;
   #context: BrowserContext | null = null;
@@ -39,8 +43,8 @@ export class BrowserSession {
     this.#initializing = null;
     this.#reloadRequested = false;
     const failures: unknown[] = [];
-    try { await context?.close(); } catch (error) { failures.push(error); }
-    try { await browser?.close(); } catch (error) { failures.push(error); }
+    try { await context?.close(); } catch (error) { if (!isAlreadyClosed(error)) failures.push(error); }
+    try { await browser?.close(); } catch (error) { if (!isAlreadyClosed(error)) failures.push(error); }
     if (failures.length) throw new AggregateError(failures, "browser_session_close_failed");
   }
 

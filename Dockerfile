@@ -13,7 +13,8 @@ FROM dependencies AS build
 COPY tsconfig.json tsconfig.build.json ./
 COPY prisma ./prisma
 COPY src ./src
-RUN npx prisma generate && npm run build
+COPY dashboard ./dashboard
+RUN npx prisma generate && npm run build && npm run dashboard:build
 
 FROM mcr.microsoft.com/playwright:v1.62.1-noble AS runtime
 WORKDIR /app
@@ -27,6 +28,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/dashboard/dist ./dashboard/dist
 COPY prisma ./prisma
 COPY LICENSE ./LICENSE
 COPY docker/server-entrypoint.sh ./docker/server-entrypoint.sh

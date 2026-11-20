@@ -25,6 +25,7 @@ export class SearchScheduler {
   }
 
   async tick(now = new Date()): Promise<void> {
+    await this.runner.recoverInterruptedRuns?.(now);
     const searches = await prisma.search.findMany({ where: { active: true } });
     const dueSearches = searches.filter((search) => {
       const dueAt = search.lastRunAt ? search.lastRunAt.getTime() + search.intervalMinutes * 60_000 : 0;

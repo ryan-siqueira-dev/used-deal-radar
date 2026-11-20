@@ -2,11 +2,13 @@ import { access } from "node:fs/promises";
 import type { Logger } from "pino";
 import type { Page } from "playwright";
 import { BrowserSession, progressiveScroll } from "../browser.js";
+import { waitForListingPage } from "../browser-listing-page.js";
+import { hasSearchResults } from "../browser-search-results.js";
 import { ProviderError, type MarketplaceProvider } from "../provider.js";
 import type { ListingDetails, ListingSummary, MarketplaceSearchCriteria } from "../types.js";
 import { deduplicateListings } from "../../listings/deduplication.js";
 import { OLX_SELECTORS } from "./selectors.js";
-import { mapOlxDetails, parseOlxSearchCard, type OlxDetailDocument, type OlxSearchCard } from "./parser.js";
+import { mapOlxDetails, parseOlxExternalId, parseOlxSearchCard, type OlxDetailDocument, type OlxSearchCard } from "./parser.js";
 
 export class OlxProvider implements MarketplaceProvider {
   readonly name = "olx" as const;
@@ -35,8 +37,13 @@ export class OlxProvider implements MarketplaceProvider {
       if (criteria.maxPrice != null) url.searchParams.set("pe", String(Math.round(criteria.maxPrice)));
       await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
       await this.assertNotBlocked(page);
-      await this.waitForAnySelector(page, OLX_SELECTORS.resultLinks);
+      this.assertBrazilWide(page, criteria.query);
+      if (!await hasSearchResults(page, OLX_SELECTORS.resultLinks, OLX_SELECTORS.emptyResults)) {
+        this.assertBrazilWide(page, criteria.query);
+        return [];
+      }
       await progressiveScroll(page, 8);
+      this.assertBrazilWide(page, criteria.query);
       const cards = await page.evaluate((selectors): OlxSearchCard[] => {
         const elements = selectors.flatMap((selector) => [...document.querySelectorAll<HTMLAnchorElement>(selector)]);
         return [...new Set(elements)].map((element) => {
@@ -50,6 +57,7 @@ export class OlxProvider implements MarketplaceProvider {
         });
       }, [...OLX_SELECTORS.resultLinks]);
       const parsed = cards.map(parseOlxSearchCard).filter((item): item is ListingSummary => item !== null);
+      if (parsed.length === 0) throw new ProviderError("olx_search_failed", "OLX showed listing links whose cards could not be parsed", true);
       return deduplicateListings(parsed).slice(0, Math.min(criteria.limit, this.maxListings));
     } catch (error) {
       if (error instanceof ProviderError) throw error;
@@ -64,57 +72,46 @@ export class OlxProvider implements MarketplaceProvider {
     const page = await this.#browser.page();
     try {
       page.setDefaultTimeout(this.timeoutMs);
-      await page.goto(listing.url, { waitUntil: "domcontentloaded" });
+      const response = await page.goto(listing.url, { waitUntil: "domcontentloaded" });
       await this.assertNotBlocked(page);
-      await page.locator([
-        'script[type="application/ld+json"]',
-        ...OLX_SELECTORS.detailTitle,
-        ...OLX_SELECTORS.detailDescription,
-      ].join(",")).first().waitFor({ state: "attached" });
+      await waitForListingPage(page, listing, {
+        parseId: parseOlxExternalId,
+        readySelector: ['script[type="application/ld+json"]', ...OLX_SELECTORS.detailTitle, ...OLX_SELECTORS.detailDescription].join(","),
+        unavailableText: OLX_SELECTORS.detailUnavailable,
+        status: response?.status(),
+      });
       const detail = await page.evaluate((selectors): OlxDetailDocument => {
-        const firstText = (candidates: readonly string[]): string | null => {
+        const reader = { firstText(candidates: readonly string[]): string | null {
           for (const selector of candidates) {
             const text = document.querySelector(selector)?.textContent?.trim();
             if (text) return text;
           }
           return null;
-        };
-        const jsonLdValues = [...document.querySelectorAll('script[type="application/ld+json"]')]
-          .flatMap((script): Record<string, unknown>[] => {
-            try {
-              const parsed = JSON.parse(script.textContent ?? "null") as unknown;
-              const roots = Array.isArray(parsed) ? parsed : [parsed];
-              return roots.flatMap((root) => {
-                if (!root || typeof root !== "object" || Array.isArray(root)) return [];
-                const record = root as Record<string, unknown>;
-                const graph = Array.isArray(record["@graph"]) ? record["@graph"] : [];
-                return [record, ...graph.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))];
-              });
-            } catch { return []; }
-          });
-        const jsonLd = jsonLdValues.find((value) => {
-          const types = Array.isArray(value["@type"]) ? value["@type"] : [value["@type"]];
-          return types.includes("Product") || types.includes("Vehicle");
-        });
-        const offers = jsonLd?.["offers"] as Record<string, unknown> | undefined;
-        const imageData = jsonLd?.["image"];
-        const jsonImages = Array.isArray(imageData) ? imageData.filter((item): item is string => typeof item === "string") : typeof imageData === "string" ? [imageData] : [];
+        } };
+        const structuredData = [...document.querySelectorAll('script[type="application/ld+json"]')]
+          .map((script) => script.textContent ?? "");
         const attributes: Record<string, unknown> = {};
+        const shippingText: string[] = [];
         for (const element of document.querySelectorAll(selectors.detailAttributes.join(","))) {
           const text = element.textContent?.trim();
           if (!text) continue;
+          shippingText.push(text);
           const [key, ...rest] = text.split(":");
-          if (key && rest.length) attributes[key.trim()] = rest.join(":").trim();
+          const value = element.tagName === "DT" && element.nextElementSibling?.tagName === "DD"
+            ? element.nextElementSibling.textContent?.trim() : rest.join(":").trim();
+          if (key && value) attributes[key.trim()] = value;
         }
         return {
-          title: (jsonLd?.["name"] as string | undefined) ?? firstText(selectors.detailTitle),
-          description: (jsonLd?.["description"] as string | undefined) ?? firstText(selectors.detailDescription),
-          priceText: typeof offers?.["price"] === "number" || typeof offers?.["price"] === "string" ? String(offers["price"]) : firstText(["[class*=price]", "main"]),
-          location: firstText(["[aria-label*=Localização]", "[class*=location]"]),
-          sellerName: firstText(selectors.detailSeller),
-          images: [...new Set([...jsonImages, ...[...document.querySelectorAll<HTMLImageElement>("main img")].map((image) => image.src).filter((src) => /^https:\/\//.test(src))])],
+          title: reader.firstText(selectors.detailTitle),
+          description: reader.firstText(selectors.detailDescription),
+          priceText: reader.firstText(selectors.detailPrice),
+          location: reader.firstText(["[aria-label*=Localização]", "[class*=location]"]),
+          sellerName: reader.firstText(selectors.detailSeller),
+          images: [...document.querySelectorAll<HTMLImageElement>("main img")].map((image) => image.src).filter((src) => /^https:\/\//.test(src)),
           attributes,
-          publishedAt: typeof jsonLd?.["datePosted"] === "string" ? jsonLd["datePosted"] : null,
+          publishedAt: null,
+          structuredData,
+          shippingText,
         };
       }, OLX_SELECTORS);
       return mapOlxDetails(listing, detail, this.storeRawData);
@@ -145,11 +142,11 @@ export class OlxProvider implements MarketplaceProvider {
     catch { throw new ProviderError("olx_session_missing", `Run npm run olx:login to create ${this.storageStatePath}`); }
   }
 
-  private async waitForAnySelector(page: Page, selectors: readonly string[]): Promise<void> {
-    for (const selector of selectors) {
-      if (await page.locator(selector).first().isVisible().catch(() => false)) return;
+  private assertBrazilWide(page: Page, query: string): void {
+    const url = new URL(page.url());
+    if (url.origin !== "https://www.olx.com.br" || !/^\/brasil\/?$/.test(url.pathname) || url.searchParams.get("q") !== query) {
+      throw new ProviderError("olx_scope_unverified", "OLX redirected away from the requested Brazil-wide search", true);
     }
-    await page.locator(selectors.join(",")).first().waitFor({ state: "attached" });
   }
 
   private async assertNotBlocked(page: Page): Promise<void> {

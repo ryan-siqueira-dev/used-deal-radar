@@ -17,7 +17,9 @@ import { deduplicateListings } from "../listings/deduplication.js";
 import { MarketAnalysisService } from "../market-analysis/service.js";
 import type { MarketStatistics } from "../market-analysis/statistics.js";
 import { findCrossMarketplaceMatch } from "../matching/cross-marketplace.js";
+import { isStrongUsedDuplicate } from "../matching/used-duplicates.js";
 import { MarketplaceRegistry } from "../marketplaces/registry.js";
+import { ProviderError } from "../marketplaces/provider.js";
 import {
   listingSummarySchema,
   listingDetailsSchema,
@@ -34,6 +36,11 @@ import { calculateDeterministicScore, combineScores, verdictForScore } from "../
 import { mapWithConcurrency } from "../utils/collections.js";
 import { listingContentHash, sha256, stableStringify } from "../utils/hash.js";
 import { prisma } from "../db/client.js";
+import { evaluateOpportunity } from "../opportunities/evaluation.js";
+import { inspectUsedListing } from "../opportunities/condition.js";
+import { getUsedSearchSettings } from "../opportunities/settings.js";
+import { SearchRunTracker } from "./search-runs.js";
+import { listingAnalysisSnapshot, searchCriteriaSnapshot } from "../searches/snapshot.js";
 
 export interface SearchRunnerOptions {
   detailConcurrency: number;
@@ -53,7 +60,7 @@ interface PreparedListing {
   extractionModel: string | null;
 }
 
-const ANALYSIS_PIPELINE_VERSION = 2;
+const ANALYSIS_PIPELINE_VERSION = 3;
 const SEARCH_RUN_LEASE_MS = 30 * 60_000;
 const SEARCH_RUN_HEARTBEAT_MS = 60_000;
 const LLM_RETRY_BACKOFF_MS = 60 * 60_000;
@@ -62,22 +69,6 @@ interface AnalysisPipelineIdentity {
   pipelineVersion: number;
   extractionModel: string | null;
   analysisModel: string | null;
-}
-
-function searchCriteriaSnapshot(search: Search): Record<string, unknown> {
-  return {
-    query: search.query,
-    category: search.category,
-    minPrice: search.minPrice?.toNumber() ?? null,
-    maxPrice: search.maxPrice?.toNumber() ?? null,
-    minYear: search.minYear,
-    maxYear: search.maxYear,
-    location: search.location,
-    radiusKm: search.radiusKm,
-    minimumScore: search.minimumScore,
-    providers: [...search.providers].sort(),
-    forbiddenWords: [...search.forbiddenWords].sort(),
-  };
 }
 
 export function validateProviderDetails(summary: ListingSummary, value: unknown): ListingDetails {
@@ -99,6 +90,7 @@ export function analysisInputHash(
   market: MarketStatistics,
   priceHistory: Array<{ price: number; observedAt: Date }>,
   pipeline: AnalysisPipelineIdentity,
+  listingSnapshot?: Record<string, unknown>,
 ): string {
   return sha256(stableStringify({
     listing: {
@@ -112,12 +104,20 @@ export function analysisInputHash(
     market,
     priceHistory,
     pipeline,
-    search: searchCriteriaSnapshot(search),
+    search: analysisCriteriaSnapshot(search),
+    ...(getUsedSearchSettings(search.opportunitySettings) && listingSnapshot ? { listingSnapshot } : {}),
   }));
+}
+
+function analysisCriteriaSnapshot(search: Search): Record<string, unknown> {
+  const snapshot = searchCriteriaSnapshot(search);
+  if (!getUsedSearchSettings(search.opportunitySettings)) delete snapshot["opportunitySettings"];
+  return snapshot;
 }
 
 export class SearchRunner {
   readonly #marketAnalysis = new MarketAnalysisService();
+  readonly #runs = new Map<string, SearchRunTracker>();
   #stopRequested = false;
 
   public constructor(
@@ -132,6 +132,10 @@ export class SearchRunner {
 
   requestStop(): void {
     this.#stopRequested = true;
+  }
+
+  async recoverInterruptedRuns(now: Date): Promise<void> {
+    await SearchRunTracker.recoverInterrupted(now);
   }
 
   async run(search: Search): Promise<void> {
@@ -150,7 +154,13 @@ export class SearchRunner {
     let discovered = 0;
     let analyzed = 0;
     let completed = false;
+    const settings = getUsedSearchSettings(search.opportunitySettings);
+    const run = settings ? new SearchRunTracker(leaseId, search.id) : null;
     try {
+      if (run) {
+        await run.start();
+        this.#runs.set(leaseId, run);
+      }
       const collected: ListingSummary[] = [];
       const searchCriteria = marketplaceSearchCriteriaSchema.parse({
         query: search.query,
@@ -166,7 +176,24 @@ export class SearchRunner {
       for (const providerValue of search.providers) {
         if (this.#stopRequested) break;
         const parsedProvider = marketplaceNameSchema.safeParse(providerValue);
-        if (!parsedProvider.success || !this.marketplaces.has(parsedProvider.data)) {
+        const providerName = parsedProvider.success ? parsedProvider.data : null;
+        const sourceCriteria = settings
+          ? marketplaceSearchCriteriaSchema.parse({
+            ...searchCriteria,
+            location: providerName === "facebook" ? settings.facebookLocation : null,
+            radiusKm: providerName === "facebook" ? settings.facebookRadiusKm : null,
+            ...(providerName === "facebook" ? { verifyLocation: true } : {}),
+            ...(providerName === "mercadolivre" ? { condition: "used" } : {}),
+          })
+          : searchCriteria;
+        if (providerName) run?.beginSource(providerName, sourceCriteria.location ?? null, sourceCriteria.radiusKm ?? null);
+        await run?.save();
+        if (!parsedProvider.success || !this.marketplaces.has(parsedProvider.data)
+          || (settings && providerName !== "olx" && providerName !== "facebook" && providerName !== "mercadolivre")) {
+          if (providerName) {
+            run?.sourceFailed(providerName, new ProviderError("provider_disabled", "Provider disabled", false), true);
+            await run?.save();
+          }
           this.logger.warn({ event: "provider_skipped", provider: providerValue, searchId: search.id }, "Provider is unknown or disabled");
           continue;
         }
@@ -174,7 +201,7 @@ export class SearchRunner {
         await this.renewRunLease(search.id, leaseId);
         this.logger.info({ event: "provider_search_started", provider: provider.name, searchId: search.id }, "Provider search started");
         try {
-          const rawSummaries = await provider.search(searchCriteria);
+          const rawSummaries = await provider.search(sourceCriteria);
           await this.renewRunLease(search.id, leaseId);
           const validSummaries: ListingSummary[] = [];
           for (const [index, rawSummary] of rawSummaries.entries()) {
@@ -192,12 +219,20 @@ export class SearchRunner {
             validSummaries.push(parsed.data);
           }
           const summaries = deduplicateListings(validSummaries);
+          if (rawSummaries.length > 0 && summaries.length === 0) {
+            throw new ProviderError("provider_results_invalid", "All returned listings were invalid", true);
+          }
+          this.marketplaces.recordSuccess(provider.name, "search");
           collected.push(...summaries);
           discovered += summaries.length;
+          run?.sourceSucceeded(provider.name, summaries.length);
           this.logger.info({ event: "provider_search_completed", provider: provider.name, searchId: search.id, listings: summaries.length }, "Provider search completed");
         } catch (error) {
+          run?.sourceFailed(provider.name, error);
+          this.marketplaces.recordFailure(provider.name, error);
           this.logger.error({ event: "provider_search_failed", provider: provider.name, searchId: search.id, err: error }, "Provider search failed");
         }
+        await run?.save();
       }
 
       const summaries = deduplicateListings(collected);
@@ -209,8 +244,13 @@ export class SearchRunner {
       analyzed = results.filter(Boolean).length;
       completed = true;
     } finally {
-      await heartbeat.stop();
-      await this.releaseRunLease(search.id, leaseId, completed && !this.#stopRequested);
+      this.#runs.delete(leaseId);
+      try {
+        await heartbeat.stop();
+        await run?.finish(discovered, analyzed, completed, this.#stopRequested);
+      } finally {
+        await this.releaseRunLease(search.id, leaseId, completed && !this.#stopRequested);
+      }
     }
     this.logger.info({ event: "search_completed", searchId: search.id, discovered, analyzed, durationMs: Date.now() - startedAt }, "Search completed");
   }
@@ -222,6 +262,7 @@ export class SearchRunner {
       return await this.prepareListing(search, summary, leaseId);
     }
     catch (error) {
+      this.#runs.get(leaseId)?.detailFailed(summary.source);
       this.logger.error({
         event: "listing_preparation_failed",
         searchId: search.id,
@@ -249,7 +290,15 @@ export class SearchRunner {
       let fetchedDetails: ListingDetails | null = null;
       try {
         fetchedDetails = validateProviderDetails(summary, await this.marketplaces.get(summary.source).getListingDetails(summary));
+        this.marketplaces.recordSuccess(summary.source, "details");
       } catch (error) {
+        this.#runs.get(leaseId)?.detailFailed(summary.source);
+        if (error instanceof ProviderError && ["retail_offer_unavailable", "listing_unavailable"].includes(error.code)) {
+          await this.listings.markUnavailable(saved.listing.id, currentFence);
+          this.logger.info({ event: "listing_unavailable", listingId: saved.listing.id }, "Unavailable retail offer skipped");
+          return null;
+        }
+        this.marketplaces.recordFailure(summary.source, error);
         const checked = await this.listings.markDetailsChecked(saved.listing.id, currentFence);
         this.logger.warn({ event: "listing_details_failed", listingId: saved.listing.id, source: summary.source, err: error }, "Listing details unavailable; summary retained");
         if (!checked) return null;
@@ -328,9 +377,13 @@ export class SearchRunner {
     if (this.#stopRequested) return false;
     try {
       await this.renewRunLease(search.id, leaseId);
-      return await this.analyzeListing(search, prepared, leaseId);
+      const analyzed = await this.analyzeListing(search, prepared, leaseId);
+      if (analyzed) this.#runs.get(leaseId)?.analysisCompleted();
+      await this.#runs.get(leaseId)?.save();
+      return analyzed;
     }
     catch (error) {
+      this.#runs.get(leaseId)?.analysisFailed();
       this.logger.error({
         event: "listing_analysis_failed",
         searchId: search.id,
@@ -345,7 +398,18 @@ export class SearchRunner {
 
   private async analyzeListing(search: Search, prepared: PreparedListing, leaseId: string): Promise<boolean> {
     const seenAfter = new Date(Date.now() - this.options.comparableMaxAgeDays * 24 * 60 * 60 * 1000);
-    const candidates = (await this.listings.findComparables(
+    const settings = getUsedSearchSettings(search.opportunitySettings);
+    const candidates = settings ? await this.listings.findUsedComparables(
+      prepared.category,
+      prepared.listingId,
+      seenAfter,
+      prepared.details.currency,
+      async (details) => {
+        if (inspectUsedListing(details).condition !== "used") return null;
+        const structured = await prepared.analyzer.extract(details);
+        return prepared.analyzer.isComparable(prepared.deterministic, structured) ? structured : null;
+      },
+    ) : (await this.listings.findComparables(
       prepared.category,
       prepared.listingId,
       seenAfter,
@@ -353,13 +417,16 @@ export class SearchRunner {
     ))
       .filter((candidate) => candidate.structured.data["condition"] !== "damaged")
       .filter((candidate) => prepared.analyzer.isComparable(prepared.deterministic, candidate.structured));
-    const withoutCurrentCrossPosts = await this.excludeCurrentCrossPosts(prepared, candidates);
-    const comparable = await this.collapseProbableCrossPosts(withoutCurrentCrossPosts);
+    const withoutCurrentCrossPosts = await this.excludeCurrentCrossPosts(prepared, candidates, Boolean(settings));
+    const comparable = await this.collapseProbableCrossPosts(withoutCurrentCrossPosts, Boolean(settings));
     const market = this.#marketAnalysis.calculate(comparable.map(({ id, source, price }) => ({ id, source, price })));
     this.logger.debug({ event: "market_reference_calculated", listingId: prepared.listingId, sampleSize: market.combined.sampleSize, confidence: market.combined.confidence }, "Market reference calculated");
 
     await this.matchCurrentListing(prepared.listingId, prepared.category, prepared.details);
     const priceHistory = await this.listings.getPriceHistory(prepared.listingId);
+    const listingSnapshot = listingAnalysisSnapshot({
+      ...prepared.details, contentHash: prepared.listingFence.contentHash, fingerprint: prepared.listingFence.fingerprint,
+    });
     const inputHash = analysisInputHash(
       search,
       prepared.details,
@@ -368,10 +435,11 @@ export class SearchRunner {
       market,
       priceHistory,
       {
-        pipelineVersion: ANALYSIS_PIPELINE_VERSION,
+        pipelineVersion: settings ? ANALYSIS_PIPELINE_VERSION : 2,
         extractionModel: prepared.extractionModel,
         analysisModel: this.llm?.analysisModel ?? null,
       },
+      settings ? listingSnapshot : undefined,
     );
     const filter = applyDeterministicFilters({
       listing: prepared.details,
@@ -383,14 +451,15 @@ export class SearchRunner {
         maxPrice: search.maxPrice?.toNumber() ?? null,
         minYear: search.minYear,
         maxYear: search.maxYear,
-        location: search.location,
-        radiusKm: search.radiusKm,
+        location: settings ? null : search.location,
+        radiusKm: settings ? null : search.radiusKm,
         forbiddenWords: search.forbiddenWords,
       },
       alreadyAnalyzed: false,
       duplicate: false,
     });
-    if (!filter.passed) return false;
+    const filterReasons = settings ? filter.reasons.filter((reason) => reason !== "invalid_price") : filter.reasons;
+    if (filterReasons.length) return false;
 
     const categoryAnalysis = await prepared.analyzer.analyze({
       listing: prepared.details,
@@ -400,7 +469,18 @@ export class SearchRunner {
       source: prepared.source,
     });
     const deterministicScore = calculateDeterministicScore(prepared.details, market, categoryAnalysis, search.maxPrice?.toNumber() ?? null);
-    const qualifiesForLlm = deterministicScore.score >= Math.max(40, search.minimumScore - 10) && market.combined.sampleSize >= 2;
+    const opportunity = settings ? {
+      ...evaluateOpportunity({ listing: prepared.details, settings, market: market.combined }),
+      searchCriteriaSnapshot: searchCriteriaSnapshot(search),
+      listingSnapshot,
+      collectionScope: {
+        location: prepared.source === "facebook" ? settings.facebookLocation : null,
+        radiusKm: prepared.source === "facebook" ? settings.facebookRadiusKm : null,
+        verified: true,
+        distanceVerified: false,
+      },
+    } : null;
+    const qualifiesForLlm = !settings && deterministicScore.score >= Math.max(40, search.minimumScore - 10) && market.combined.sampleSize >= 2;
     this.logger.debug({ event: "deal_candidate_selected", listingId: prepared.listingId, deterministicScore: deterministicScore.score, qualifiesForLlm }, "Candidate scored");
     const existing = await this.listings.findAnalysis(prepared.listingId, search.id, inputHash);
     const retryFailedLlm = Boolean(
@@ -412,11 +492,19 @@ export class SearchRunner {
     );
     if (existing && !retryFailedLlm) {
       await this.renewRunLease(search.id, leaseId);
-      await this.notifyIfNeeded(search, prepared.details, prepared.listingFence, existing.id, this.dealAnalysisFromRecord(existing), market, existing.priceDifferencePercent?.toNumber() ?? null);
+      if (settings) await this.listings.setCurrentAnalysis(search.id, prepared.listingId, existing.id, prepared.listingFence);
+      await this.notifyIfNeeded(search, prepared.details, prepared.listingFence, existing.id, this.dealAnalysisFromRecord(existing), market, existing.priceDifferencePercent?.toNumber() ?? null, leaseId);
       return false;
     }
 
     let analysis = this.fallbackAnalysis(deterministicScore.score, categoryAnalysis.advantages, categoryAnalysis.risks);
+    if (opportunity) {
+      analysis = {
+        ...analysis,
+        reason: opportunity.reason,
+        risks: [...new Set([...analysis.risks, ...opportunity.warnings])],
+      };
+    }
     let analysisModel: string | null = null;
     let llmAttempted = false;
     if (this.llm && qualifiesForLlm) {
@@ -457,6 +545,7 @@ export class SearchRunner {
       analysisModel,
       llmAttempted,
       inputHash,
+      ...(opportunity ? { opportunity } : {}),
     });
     if (!persistedAnalysis) return false;
     await this.renewRunLease(search.id, leaseId);
@@ -468,6 +557,7 @@ export class SearchRunner {
       this.dealAnalysisFromRecord(persistedAnalysis),
       market,
       persistedAnalysis.priceDifferencePercent?.toNumber() ?? null,
+      leaseId,
     );
     return true;
   }
@@ -480,10 +570,21 @@ export class SearchRunner {
     analysis: DealAnalysis,
     market: MarketStatistics,
     differencePercent: number | null,
+    leaseId: string,
   ): Promise<void> {
-    if (this.#stopRequested || !this.telegram || analysis.score < search.minimumScore) return;
-    const claim = await this.listings.claimNotification({ analysisId, channel: "telegram", listingFence });
+    if (this.#stopRequested || getUsedSearchSettings(search.opportunitySettings) || !this.telegram || analysis.score < search.minimumScore) return;
+    const current = await prisma.search.findUnique({ where: { id: search.id } });
+    if (!current?.active || stableStringify(analysisCriteriaSnapshot(current)) !== stableStringify(analysisCriteriaSnapshot(search))) return;
+    const claim = await this.listings.claimNotification({
+      analysisId, channel: "telegram", listingFence, searchCriteria: searchCriteriaSnapshot(search), runLeaseId: leaseId,
+    });
     if (!claim) return;
+    const beforeDelivery = await prisma.search.findUnique({ where: { id: search.id } });
+    if (!beforeDelivery?.active || beforeDelivery.runLeaseId !== leaseId || beforeDelivery.opportunitySettings !== null
+      || stableStringify(analysisCriteriaSnapshot(beforeDelivery)) !== stableStringify(analysisCriteriaSnapshot(search))) {
+      await this.listings.markNotificationFailed(claim, new Error("search_changed_before_delivery"));
+      return;
+    }
     try {
       await this.telegram.send(formatDealNotification(details, analysis.score, analysis, market, differencePercent));
       if (!await this.listings.markNotificationSent(claim)) {
@@ -536,7 +637,7 @@ export class SearchRunner {
       : deterministic;
   }
 
-  private async collapseProbableCrossPosts(records: ComparableRecord[]): Promise<ComparableRecord[]> {
+  private async collapseProbableCrossPosts(records: ComparableRecord[], usedOnly = false): Promise<ComparableRecord[]> {
     const excluded = new Set<string>();
     for (let left = 0; left < records.length; left += 1) {
       const a = records[left];
@@ -545,31 +646,33 @@ export class SearchRunner {
         const b = records[right];
         if (!b || excluded.has(b.id)) continue;
         const match = findCrossMarketplaceMatch(a, b);
-        if (match) {
+        if (usedOnly ? isStrongUsedDuplicate(a, b) : Boolean(match)) {
           excluded.add(b.id);
-          await this.listings.saveCrossMatch(match.listingAId, match.listingBId, match.confidence, match.reasons);
+          if (match) await this.listings.saveCrossMatch(match.listingAId, match.listingBId, match.confidence, match.reasons);
         }
       }
     }
     return records.filter((record) => !excluded.has(record.id));
   }
 
-  private async excludeCurrentCrossPosts(prepared: PreparedListing, records: ComparableRecord[]): Promise<ComparableRecord[]> {
+  private async excludeCurrentCrossPosts(prepared: PreparedListing, records: ComparableRecord[], usedOnly = false): Promise<ComparableRecord[]> {
     const current = {
       id: prepared.listingId,
       source: prepared.source,
       title: prepared.details.title,
       price: prepared.details.price,
       location: prepared.details.location,
+      sellerName: prepared.details.sellerName,
+      imageUrl: prepared.details.imageUrl,
     };
     const retained: ComparableRecord[] = [];
     for (const candidate of records) {
       const match = findCrossMarketplaceMatch(current, candidate);
-      if (!match) {
+      if (!(usedOnly ? isStrongUsedDuplicate(current, candidate) : Boolean(match))) {
         retained.push(candidate);
         continue;
       }
-      await this.listings.saveCrossMatch(match.listingAId, match.listingBId, match.confidence, match.reasons);
+      if (match) await this.listings.saveCrossMatch(match.listingAId, match.listingBId, match.confidence, match.reasons);
     }
     return retained;
   }
@@ -592,6 +695,7 @@ export class SearchRunner {
         id: search.id,
         active: true,
         lastRunAt: search.lastRunAt,
+        updatedAt: search.updatedAt,
         OR: [
           { runLeaseId: null, runLeaseExpiresAt: null },
           { runLeaseExpiresAt: { lte: now } },
@@ -625,7 +729,7 @@ export class SearchRunner {
 
   private async renewRunLease(searchId: string, leaseId: string): Promise<void> {
     const renewed = await prisma.search.updateMany({
-      where: { id: searchId, runLeaseId: leaseId },
+      where: { id: searchId, runLeaseId: leaseId, active: true, runLeaseExpiresAt: { gt: new Date() } },
       data: { runLeaseExpiresAt: new Date(Date.now() + SEARCH_RUN_LEASE_MS) },
     });
     if (renewed.count !== 1) throw new Error("search_run_lease_lost");
@@ -633,7 +737,7 @@ export class SearchRunner {
 
   private async releaseRunLease(searchId: string, leaseId: string, completed: boolean): Promise<void> {
     const released = await prisma.search.updateMany({
-      where: { id: searchId, runLeaseId: leaseId },
+      where: { id: searchId, runLeaseId: leaseId, runLeaseExpiresAt: { gt: new Date() } },
       data: {
         runLeaseId: null,
         runLeaseExpiresAt: null,

@@ -37,7 +37,25 @@ O AI Deal Finder demonstra como organizar um pipeline de dados resiliente para:
 - calcular um score reproduzível, com contribuição opcional e limitada de uma LLM;
 - persistir análises idempotentes e entregar oportunidades pelo Telegram com controle de concorrência.
 
-O foco do repositório é arquitetura backend e operação self-hosted. Não há interface web, API HTTP pública, compra automática nem garantia de acesso a catálogos de terceiros.
+O foco do repositório é operação self-hosted. Há um painel local em desenvolvimento, mas não há API HTTP pública, compra automática nem garantia de acesso a catálogos de terceiros.
+
+## Início manual pelo terminal
+
+Com Node.js 22 ou superior, dependências instaladas e Docker disponível, abra o menu local.
+
+```bash
+npm run tui
+```
+
+Escolha **Iniciar** para subir o PostgreSQL no Docker, compilar e executar o painel e os coletores na sua máquina. O menu também permite abrir o painel, acompanhar logs e parar os serviços. **Sair** fecha o TUI e mantém os serviços no estado atual. **Parar** preserva os dados e as sessões para a próxima execução.
+
+O modo local usa PostgreSQL com reinício automático desativado e um processo local controlado pelo TUI. A preparação inicial ocorre ao escolher Iniciar e gera uma configuração privada quando `.env` está ausente. Consulte [docs/DASHBOARD.md](docs/DASHBOARD.md) para os detalhes da operação.
+
+## Oportunidades em usados
+
+O painel local permite cadastrar pesquisas automáticas de usados para uso próprio ou revenda. A OLX busca em todo o Brasil e o Facebook usa Itajaí–SC com raio inicial de 40 km, configurável por pesquisa. O sistema compara usados equivalentes, mostra candidatos com informações pendentes e destaca oportunidades com desconto mínimo de 15% sobre a mediana de pelo menos cinco comparáveis. Para revenda, considera custos e taxas informados.
+
+As avaliações são específicas de cada pesquisa, com histórico de preços e resultados por execução e fonte. O novo fluxo entrega resultados no painel. Os coletores web continuam experimentais e dependem de sessões válidas e validação no ambiente de uso. Consulte [docs/DASHBOARD.md](docs/DASHBOARD.md) para configurar e executar.
 
 ## Status real
 
@@ -47,6 +65,8 @@ O foco do repositório é arquitetura backend e operação self-hosted. Não há
 | Mercado Livre web | Playwright com perfil persistente e parser isolado | Desativado; `web` é apenas o modo configuracional inicial | Experimental e sujeito a layout, sessão e bloqueios. Só deve ser usado com autorização expressa aplicável. Não é fallback automático da API. |
 | OLX web | Playwright, JSON-LD, fallbacks semânticos e inspeção | `OLX_ENABLED=false` | Experimental e opt-in. Pode ser bloqueado antes de retornar resultados; falha de forma explícita, sem contornar proteção. Exige autorização expressa e validação no ambiente de execução. |
 | Facebook Marketplace web | Playwright com `storageState`, scroll e inspeção | `FACEBOOK_ENABLED=false` | Experimental e opt-in. Depende de conta, região, sessão e markup atuais. Checkpoints e desafios interrompem o fluxo. Exige autorização expressa por escrito conforme os termos aplicáveis. |
+| KaBuM! | Coletor HTTP de dados estruturados para busca e detalhes | Desativado | Busca e detalhes verificados pontualmente em 30/10/2026; dados e preços podem mudar. |
+| Terabyte | Coletor HTTP de dados estruturados | Desativado | Experimental e não validado: o host de teste recebeu HTTP 403. |
 | Análise determinística | Analyzers, filtros, comparáveis e score | Ativa | Funciona sem LLM; é a base reproduzível do pipeline. |
 | LLM OpenAI-compatible | Extração suplementar e análise final | Desativada sem configuração completa | Opcional. Falhas preservam o resultado determinístico. A resposta é validada com Zod e sua contribuição ao score final é limitada. |
 | Telegram | Formatação HTML e envio com estado de entrega | Desativado sem token e chat | Opcional. Notifica somente análises que atingem o score mínimo. |
@@ -513,7 +533,7 @@ docs/PROVIDERS.md           detalhes e checklist dos providers
 - A LLM é opcional e probabilística; sua validação estrutural não verifica a veracidade do conteúdo.
 - O claim de Telegram reduz duplicidade concorrente, mas não oferece exatamente uma vez diante de falha após o envio externo.
 - A CI aplica migrations em PostgreSQL limpo; upgrades com dados legados continuam exigindo backup e validação operacional.
-- Não há painel, API pública, edição de pesquisas por CLI, exportação ou política automática de retenção.
+- O painel local está em desenvolvimento; não há API pública, edição de pesquisas por CLI, exportação ou política automática de retenção.
 - Os CLIs mostram parte dos dados operacionais; use Prisma Studio para auditoria completa dos critérios e relações.
 
 ## Roadmap possível

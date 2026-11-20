@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { ListingDetails } from "../marketplaces/types.js";
 import type { DealAnalysis } from "../llm/types.js";
 import type { MarketStatistics } from "../market-analysis/statistics.js";
-import { isMarketplaceUrl } from "../marketplaces/types.js";
+import { isMarketplaceUrl, marketplaceNames } from "../marketplaces/types.js";
 import { fetchWithRetry } from "../utils/http.js";
 
 const telegramResponseSchema = z.discriminatedUnion("ok", [
@@ -64,7 +64,7 @@ export function formatDealNotification(
   market: MarketStatistics,
   differencePercent: number | null,
 ): string {
-  const providerLines = (["facebook", "olx", "mercadolivre"] as const)
+  const providerLines = marketplaceNames
     .flatMap((source) => market.byProvider[source] ? [`${source}: <b>${money(market.byProvider[source]?.medianPrice ?? null, listing.currency)}</b>`] : []);
   const advantages = bullets(analysis.advantages, "Nenhum ponto adicional informado");
   const risks = bullets(analysis.risks, "Verificar condição e procedência");

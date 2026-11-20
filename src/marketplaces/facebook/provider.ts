@@ -2,15 +2,19 @@ import { access } from "node:fs/promises";
 import type { Logger } from "pino";
 import type { Page } from "playwright";
 import { BrowserSession, progressiveScroll } from "../browser.js";
+import { waitForListingPage } from "../browser-listing-page.js";
+import { hasSearchResults } from "../browser-search-results.js";
 import { ProviderError, type MarketplaceProvider } from "../provider.js";
-import type { ListingDetails, ListingSummary, MarketplaceSearchCriteria } from "../types.js";
+import { isMarketplaceUrl, type ListingDetails, type ListingSummary, type MarketplaceSearchCriteria } from "../types.js";
 import { deduplicateListings } from "../../listings/deduplication.js";
 import { FACEBOOK_SELECTORS } from "./selectors.js";
-import { mapFacebookDetails, parseFacebookSearchCard, type FacebookDetailDocument, type FacebookSearchCard } from "./parser.js";
+import { selectFacebookLocation, verifyFacebookLocation } from "./location.js";
+import { mapFacebookDetails, parseFacebookExternalId, parseFacebookSearchCard, type FacebookDetailDocument, type FacebookSearchCard } from "./parser.js";
 
 export class FacebookMarketplaceProvider implements MarketplaceProvider {
   readonly name = "facebook" as const;
   readonly #browser: BrowserSession;
+  #searchTail: Promise<unknown> = Promise.resolve();
 
   public constructor(
     private readonly storageStatePath: string,
@@ -24,30 +28,73 @@ export class FacebookMarketplaceProvider implements MarketplaceProvider {
     this.#browser = new BrowserSession({ headless, storageStatePath, ...(executablePath ? { executablePath } : {}) });
   }
 
-  async search(criteria: MarketplaceSearchCriteria): Promise<ListingSummary[]> {
+  search(criteria: MarketplaceSearchCriteria): Promise<ListingSummary[]> {
+    // The active Marketplace location is shared by pages in this session.
+    const search = this.#searchTail.then(() => this.searchPage(criteria));
+    this.#searchTail = search.catch(() => undefined);
+    return search;
+  }
+
+  private async searchPage(criteria: MarketplaceSearchCriteria): Promise<ListingSummary[]> {
     await this.requireSession();
     const page = await this.#browser.page();
     try {
       page.setDefaultTimeout(this.timeoutMs);
       const url = new URL("https://www.facebook.com/marketplace/search/");
+      if (criteria.verifyLocation) {
+        await this.withScopeVerification(criteria, async (location, radiusKm) => {
+          await page.goto("https://www.facebook.com/marketplace/", { waitUntil: "domcontentloaded" });
+          await this.assertAuthenticated(page);
+          await selectFacebookLocation(page, location, radiusKm);
+          const current = new URL(page.url());
+          // Reuse a region path exposed by Marketplace after applying the UI filter.
+          if (isMarketplaceUrl(this.name, current.href) && /^\/marketplace\/\d+\/?$/.test(current.pathname)) {
+            url.pathname = `${current.pathname.replace(/\/$/, "")}/search/`;
+          }
+        });
+      }
       url.searchParams.set("query", criteria.query);
       if (criteria.minPrice != null) url.searchParams.set("minPrice", String(Math.round(criteria.minPrice)));
       if (criteria.maxPrice != null) url.searchParams.set("maxPrice", String(Math.round(criteria.maxPrice)));
       if (criteria.radiusKm != null) url.searchParams.set("radius", String(criteria.radiusKm));
       await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
       await this.assertAuthenticated(page);
-      await page.locator(FACEBOOK_SELECTORS.resultLinks.join(",")).first().waitFor({ state: "attached" });
+      if (criteria.verifyLocation) {
+        await this.withScopeVerification(criteria, async (location, radiusKm) => {
+          const current = new URL(page.url());
+          if (!isMarketplaceUrl(this.name, current.href) || !/^\/marketplace\/(?:\d+\/)?search\/?$/.test(current.pathname)
+            || current.searchParams.get("query") !== criteria.query) throw new Error("Facebook redirected away from the requested search");
+          await verifyFacebookLocation(page, location, radiusKm);
+        });
+      }
+      if (!await hasSearchResults(page, FACEBOOK_SELECTORS.resultLinks, FACEBOOK_SELECTORS.emptyResults)) return [];
       await progressiveScroll(page, 8, 900);
-      const cards = await page.evaluate((selectors): FacebookSearchCard[] => {
-        const elements = selectors.flatMap((selector) => [...document.querySelectorAll<HTMLAnchorElement>(selector)]);
-        return [...new Set(elements)].map((element) => ({
+      const cards = await page.evaluate(({ selectors, scoped }): FacebookSearchCard[] => {
+        const root = scoped ? document.querySelector(selectors.searchMain) : document;
+        if (!root) return [];
+        const links = selectors.resultLinks.join(",");
+        const layout = {
+          visible(element: Element) {
+            return element.getClientRects().length > 0
+              && element.checkVisibility?.({ visibilityProperty: true }) !== false
+              && !element.closest('[hidden], [aria-hidden="true"]');
+          },
+        };
+        const fallback = scoped ? [...root.querySelectorAll(selectors.fallbackLabels)].find((label) =>
+          layout.visible(label) && !label.closest(links) && [label.getAttribute("aria-label"), label.textContent]
+            .some((text) => selectors.fallbackResults.test(text?.replace(/\s+/g, " ").trim() ?? ""))) : undefined;
+        // Marketplace appends broader matches below the primary local results.
+        const elements = [...root.querySelectorAll<HTMLAnchorElement>(links)].filter((element) =>
+          !scoped || (layout.visible(element) && !(fallback && (fallback.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING))));
+        return elements.map((element) => ({
           href: element.href,
           text: element.innerText,
           ariaLabel: element.getAttribute("aria-label"),
           image: element.querySelector("img")?.src ?? null,
         }));
-      }, [...FACEBOOK_SELECTORS.resultLinks]);
+      }, { selectors: FACEBOOK_SELECTORS, scoped: criteria.verifyLocation === true });
       const parsed = cards.map(parseFacebookSearchCard).filter((item): item is ListingSummary => item !== null);
+      if (parsed.length === 0) throw new ProviderError("facebook_search_failed", "Facebook showed listing links whose cards could not be parsed", true);
       return deduplicateListings(parsed).slice(0, Math.min(criteria.limit, this.maxListings));
     } catch (error) {
       if (error instanceof ProviderError) throw error;
@@ -57,14 +104,32 @@ export class FacebookMarketplaceProvider implements MarketplaceProvider {
     }
   }
 
+  private async withScopeVerification(
+    criteria: MarketplaceSearchCriteria,
+    operation: (location: string, radiusKm: number) => Promise<void>,
+  ): Promise<void> {
+    try {
+      if (!criteria.location || !criteria.radiusKm) throw new Error("Facebook needs a location and radius");
+      await operation(criteria.location, criteria.radiusKm);
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
+      throw new ProviderError("facebook_scope_unverified", "Facebook Marketplace could not verify the requested location and radius", true, { cause: error });
+    }
+  }
+
   async getListingDetails(listing: ListingSummary): Promise<ListingDetails> {
     await this.requireSession();
     const page = await this.#browser.page();
     try {
       page.setDefaultTimeout(this.timeoutMs);
-      await page.goto(listing.url, { waitUntil: "domcontentloaded" });
+      const response = await page.goto(listing.url, { waitUntil: "domcontentloaded" });
       await this.assertAuthenticated(page);
-      await page.locator(FACEBOOK_SELECTORS.detailMain.join(",")).first().waitFor({ state: "attached" });
+      await waitForListingPage(page, listing, {
+        parseId: parseFacebookExternalId,
+        readySelector: FACEBOOK_SELECTORS.detailMain.join(","),
+        unavailableText: FACEBOOK_SELECTORS.detailUnavailable,
+        status: response?.status(),
+      });
       const detail = await page.evaluate((selectors): FacebookDetailDocument => {
         const main = document.querySelector<HTMLElement>(selectors.detailMain.join(","));
         const text = main?.innerText ?? "";
@@ -82,13 +147,9 @@ export class FacebookMarketplaceProvider implements MarketplaceProvider {
           .map((image) => image.src)
           .filter((src) => !src.includes("emoji") && !src.includes("profile"));
         if (ogImage?.startsWith("https://")) images.unshift(ogImage);
-        const attributes: Record<string, unknown> = {};
-        for (let index = 0; index < lines.length - 1; index += 1) {
-          const key = lines[index];
-          const value = lines[index + 1];
-          if (key && value && /^(ano|quilometragem|transmissão|combustível|condição|marca|modelo)$/i.test(key)) attributes[key] = value;
-        }
-        return { title, text, description, priceText, location, sellerName, images, attributes };
+        const structuredData = [...document.querySelectorAll('script[type="application/ld+json"]')]
+          .map((script) => script.textContent ?? "");
+        return { title, text, description, priceText, location, sellerName, images, attributes: {}, structuredData };
       }, FACEBOOK_SELECTORS);
       return mapFacebookDetails(listing, detail, this.storeRawData);
     } catch (error) {

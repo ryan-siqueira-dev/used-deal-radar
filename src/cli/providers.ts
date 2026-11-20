@@ -30,7 +30,7 @@ async function main(): Promise<void> {
       })));
       return;
     }
-    if (command !== "test") throw new Error("Uso: npm run providers:list | npm run provider:test -- <facebook|olx|mercadolivre> [--query texto] [--inspect]");
+    if (command !== "test") throw new Error("Uso: npm run providers:list | npm run provider:test -- <facebook|olx|mercadolivre|kabum|terabyte> [--query texto] [--inspect]");
     const providerName = marketplaceNameSchema.parse(providerArgument);
     if (!app.marketplaces.has(providerName)) throw new Error(`provider_disabled:${providerName}`);
     const provider = app.marketplaces.get(providerName);

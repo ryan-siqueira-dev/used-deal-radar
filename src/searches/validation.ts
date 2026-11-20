@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { listingCategorySchema } from "../categories/types.js";
 import { marketplaceNameSchema } from "../marketplaces/types.js";
+import { usedSearchSettingsSchema } from "../opportunities/settings.js";
 
 const nullableMoney = z.number().finite().nonnegative().max(999_999_999_999.99).nullable();
 const nullableYear = z.number().int().min(1900).max(2200).nullable();
@@ -18,6 +19,7 @@ export const searchDefinitionSchema = z.object({
   radiusKm: z.number().int().positive().max(2_000).nullable(),
   minimumScore: z.number().int().min(0).max(100),
   intervalMinutes: z.number().int().positive().max(525_600),
+  opportunitySettings: usedSearchSettingsSchema.nullish(),
   forbiddenWords: z.array(z.string().trim().min(1).max(100)).max(50)
     .transform((values) => [...new Set(values)]),
 }).superRefine((value, context) => {
@@ -29,6 +31,13 @@ export const searchDefinitionSchema = z.object({
   }
   if (value.radiusKm !== null && value.location === null) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["radiusKm"], message: "requires location" });
+  }
+  if (value.opportunitySettings && value.providers.some((provider) => provider !== "olx" && provider !== "facebook" && provider !== "mercadolivre")) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["providers"],
+      message: "used opportunities require OLX, Facebook or Mercado Livre providers",
+    });
   }
 });
 

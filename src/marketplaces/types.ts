@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const marketplaceNames = ["facebook", "olx", "mercadolivre"] as const;
+export const marketplaceNames = ["facebook", "olx", "mercadolivre", "kabum", "terabyte"] as const;
 export const marketplaceNameSchema = z.enum(marketplaceNames);
 export type MarketplaceName = z.infer<typeof marketplaceNameSchema>;
 
@@ -19,6 +19,8 @@ export function isMarketplaceUrl(source: MarketplaceName, value: string): boolea
     const hostname = url.hostname.toLowerCase();
     if (source === "facebook") return hostname === "facebook.com" || hostname.endsWith(".facebook.com");
     if (source === "olx") return hostname === "olx.com.br" || hostname.endsWith(".olx.com.br");
+    if (source === "kabum") return hostname === "kabum.com.br" || hostname.endsWith(".kabum.com.br");
+    if (source === "terabyte") return hostname === "terabyteshop.com.br" || hostname.endsWith(".terabyteshop.com.br");
     return hostname === "mercadolivre.com.br"
       || hostname.endsWith(".mercadolivre.com.br")
       || hostname === "mercadolibre.com"
@@ -31,11 +33,13 @@ const httpUrlSchema = z.string().trim().max(4_096).url().refine(isHttpUrl, "URL 
 export const marketplaceSearchCriteriaSchema = z.object({
   query: z.string().trim().min(1),
   minPrice: z.number().nonnegative().nullable().optional(),
-  maxPrice: z.number().positive().nullable().optional(),
+  maxPrice: z.number().nonnegative().nullable().optional(),
   minYear: z.number().int().min(1900).max(2200).nullable().optional(),
   maxYear: z.number().int().min(1900).max(2200).nullable().optional(),
   location: z.string().trim().min(1).nullable().optional(),
   radiusKm: z.number().int().positive().nullable().optional(),
+  verifyLocation: z.boolean().optional(),
+  condition: z.literal("used").optional(),
   limit: z.number().int().positive().max(200).default(50),
 });
 export type MarketplaceSearchCriteria = z.infer<typeof marketplaceSearchCriteriaSchema>;

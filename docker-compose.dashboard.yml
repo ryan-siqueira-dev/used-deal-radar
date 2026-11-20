@@ -1,0 +1,45 @@
+# Use a distinct Compose project and volume; this does not mount the old database.
+name: ai-deal-finder-dashboard
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: deal_finder_dashboard
+      POSTGRES_USER: deal_finder
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
+    volumes:
+      - dashboard_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deal_finder -d deal_finder_dashboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  dashboard:
+    build: .
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: deal_finder_dashboard
+      DATABASE_USER: deal_finder
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}"
+      DASHBOARD_CONTAINER: "true"
+      HOME: /tmp/ai-deal-finder-home
+      PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+      - ./.runtime:/app/.runtime
+    shm_size: "1gb"
+    init: true
+    stop_grace_period: "${APP_STOP_GRACE_PERIOD:-21m}"
+    command: ["node", "dist/dashboard/index.js"]
+volumes:
+  dashboard_postgres_data:

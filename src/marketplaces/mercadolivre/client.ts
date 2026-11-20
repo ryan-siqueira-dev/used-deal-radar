@@ -25,6 +25,7 @@ export class MercadoLivreClient {
       const pageLimit = Math.min(50, criteria.limit - results.length);
       const url = new URL("/sites/MLB/search", this.#baseUrl);
       url.searchParams.set("q", criteria.query);
+      if (criteria.condition) url.searchParams.set("condition", criteria.condition);
       url.searchParams.set("limit", String(pageLimit));
       url.searchParams.set("offset", String(offset));
       if (criteria.minPrice != null || criteria.maxPrice != null) {

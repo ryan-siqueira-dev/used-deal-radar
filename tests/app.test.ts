@@ -21,6 +21,13 @@ describe("application provider wiring", () => {
     await app.shutdown();
   });
 
+  it("registers the retail sources only when enabled", async () => {
+    const app = createApplication(config({ KABUM_ENABLED: "true", TERABYTE_ENABLED: "true" }));
+    expect(app.marketplaces.has("kabum")).toBe(true);
+    expect(app.marketplaces.has("terabyte")).toBe(true);
+    await app.shutdown();
+  });
+
   it("wires each Mercado Livre mode only when explicitly enabled", async () => {
     const webApp = createApplication(config({ MERCADOLIVRE_ENABLED: "true", MERCADOLIVRE_MODE: "web" }));
     expect(webApp.marketplaces.get("mercadolivre")).toBeInstanceOf(MercadoLivreWebProvider);

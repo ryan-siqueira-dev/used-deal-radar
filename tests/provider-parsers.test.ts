@@ -22,6 +22,11 @@ describe("Mercado Livre mapper", () => {
     expect(details.images).toEqual(["https://http2.mlstatic.com/full.jpg"]);
     expect(details.rawData).toBeUndefined();
   });
+  it("preserves explicit API condition without raw storage", () => {
+    const details = mapMercadoLivreDetails({ ...item, pictures: [], condition: "used" }, null);
+    expect(details.attributes["condition"]).toBe("used");
+    expect(details.rawData).toBeUndefined();
+  });
   it("keeps raw API data only by opt-in and discards invalid images and dates", () => {
     const raw = {
       ...item, seller_id: 1, seller_address: {},

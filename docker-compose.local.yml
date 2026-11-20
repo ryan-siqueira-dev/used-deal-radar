@@ -1,0 +1,17 @@
+services:
+  postgres:
+    restart: "no"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+  dashboard:
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - 'fetch("http://127.0.0.1:3000/").then(response => { if (!response.ok) process.exitCode = 1; }).catch(() => { process.exitCode = 1; })'
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s

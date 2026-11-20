@@ -30,6 +30,8 @@ function enabledProviders(config: AppConfig): MarketplaceName[] {
   return marketplaceNames.filter((provider) => {
     if (provider === "facebook") return config.FACEBOOK_ENABLED;
     if (provider === "olx") return config.OLX_ENABLED;
+    if (provider === "kabum") return config.KABUM_ENABLED;
+    if (provider === "terabyte") return config.TERABYTE_ENABLED;
     return config.MERCADOLIVRE_ENABLED;
   });
 }
@@ -61,7 +63,11 @@ async function createSearch(): Promise<void> {
     });
     const disabled = definition.providers.filter((provider) => !defaultProviders.includes(provider));
     if (disabled.length) console.warn(`Aviso: providers atualmente desabilitados: ${disabled.join(", ")}`);
-    const search = await prisma.search.create({ data: definition });
+    const { opportunitySettings, ...fields } = definition;
+    const search = await prisma.search.create({ data: {
+      ...fields,
+      ...(opportunitySettings ? { opportunitySettings } : {}),
+    } });
     console.log(`Pesquisa criada: ${search.id}`);
   } finally { readline.close(); }
 }

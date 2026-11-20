@@ -11,6 +11,12 @@ describe("market statistics", () => {
     expect(percentageDifference(1300, 1520)).toBeCloseTo(-14.47, 2);
   });
 
+  it("includes new stores in per-source references", () => {
+    const result = calculateMarketStatistics([{id:"a",source:"kabum",price:100},{id:"b",source:"terabyte",price:120}]);
+    expect(result.byProvider.kabum?.medianPrice).toBe(100);
+    expect(result.byProvider.terabyte?.medianPrice).toBe(120);
+  });
+
   it("keeps provider references separate and also combines samples", () => {
     const market = calculateMarketStatistics([
       { id: "1", source: "facebook", price: 1450 },

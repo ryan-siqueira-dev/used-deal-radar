@@ -40,6 +40,10 @@ const databaseUrlSchema = z.string().trim().superRefine((value, context) => {
 
 const envSchema = z.object({
   DATABASE_URL: databaseUrlSchema,
+  KABUM_ENABLED: booleanFromEnv(false),
+  KABUM_MAX_LISTINGS_PER_RUN: z.coerce.number().int().positive().max(200).default(5),
+  TERABYTE_ENABLED: booleanFromEnv(false),
+  TERABYTE_MAX_LISTINGS_PER_RUN: z.coerce.number().int().positive().max(200).default(5),
   FACEBOOK_ENABLED: booleanFromEnv(false),
   FACEBOOK_STORAGE_STATE_PATH: requiredPath.default("./data/facebook-session.json"),
   FACEBOOK_MAX_LISTINGS_PER_RUN: z.coerce.number().int().positive().max(200).default(50),

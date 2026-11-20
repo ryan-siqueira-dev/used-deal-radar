@@ -182,6 +182,7 @@ describe("ListingRepository notification delivery", () => {
       advantages: [],
       risks: [],
       reason: "persisted winner",
+      opportunity: null,
       analysisModel: null,
       llmAttemptedAt: null,
       inputHash: "hash",

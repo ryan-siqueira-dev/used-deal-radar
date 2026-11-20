@@ -24,6 +24,7 @@ export function mapMercadoLivreDetails(item: MlItem, description: string | null,
     .filter((image) => /^https?:\/\//i.test(image))
     .slice(0, 50);
   const attributes = Object.fromEntries(item.attributes.slice(0, 200).map((attribute) => [attribute.name, attribute.value_name ?? attribute.value_id ?? null]));
+  if (typeof item["condition"] === "string") attributes["condition"] = item["condition"];
   const publishedAt = item.date_created ? new Date(item.date_created) : null;
   return {
     source: "mercadolivre",

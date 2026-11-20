@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { RetailProvider } from "./marketplaces/retail/provider.js";
 import type { AppConfig } from "./config/env.js";
 import { createLogger } from "./config/logger.js";
 import { CategoryAnalyzerRegistry } from "./categories/registry.js";
@@ -59,6 +60,8 @@ export function createApplication(config: AppConfig): Application {
         config.STORE_RAW_PROVIDER_DATA,
       ));
   }
+  if (config.KABUM_ENABLED) marketplaces.register(new RetailProvider("kabum", config.KABUM_MAX_LISTINGS_PER_RUN, config.PROVIDER_REQUEST_TIMEOUT_MS));
+  if (config.TERABYTE_ENABLED) marketplaces.register(new RetailProvider("terabyte", config.TERABYTE_MAX_LISTINGS_PER_RUN, config.PROVIDER_REQUEST_TIMEOUT_MS));
   if (config.OLX_ENABLED) marketplaces.register(new OlxProvider(config.OLX_STORAGE_STATE_PATH, config.OLX_HEADLESS, config.OLX_MAX_LISTINGS_PER_RUN, config.PROVIDER_REQUEST_TIMEOUT_MS, logger, config.STORE_RAW_PROVIDER_DATA, config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH));
   if (config.FACEBOOK_ENABLED) marketplaces.register(new FacebookMarketplaceProvider(config.FACEBOOK_STORAGE_STATE_PATH, config.FACEBOOK_HEADLESS, config.FACEBOOK_MAX_LISTINGS_PER_RUN, config.PROVIDER_REQUEST_TIMEOUT_MS, logger, config.STORE_RAW_PROVIDER_DATA, config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH));
 
@@ -89,7 +92,7 @@ export function createApplication(config: AppConfig): Application {
 
   const runner = new SearchRunner(marketplaces, analyzers, new ListingRepository(), llm, telegram, logger, {
     detailConcurrency: config.DETAIL_FETCH_CONCURRENCY,
-    defaultLimit: Math.max(config.FACEBOOK_MAX_LISTINGS_PER_RUN, config.OLX_MAX_LISTINGS_PER_RUN, config.MERCADOLIVRE_MAX_LISTINGS_PER_RUN),
+    defaultLimit: Math.max(config.FACEBOOK_MAX_LISTINGS_PER_RUN, config.OLX_MAX_LISTINGS_PER_RUN, config.MERCADOLIVRE_MAX_LISTINGS_PER_RUN, config.KABUM_MAX_LISTINGS_PER_RUN, config.TERABYTE_MAX_LISTINGS_PER_RUN),
     comparableMaxAgeDays: config.COMPARABLE_MAX_AGE_DAYS,
   });
   const scheduler = new SearchScheduler(runner, new InMemoryJobLock(), logger);

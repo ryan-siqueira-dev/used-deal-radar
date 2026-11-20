@@ -35,6 +35,7 @@ function searchFixture(change: Partial<Search> = {}): Search {
     lastRunAt: null,
     runLeaseId: null,
     runLeaseExpiresAt: null,
+    opportunitySettings: null,
     ...change,
   };
 }

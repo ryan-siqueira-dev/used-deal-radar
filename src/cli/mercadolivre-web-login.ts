@@ -1,4 +1,4 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -9,6 +9,8 @@ import { writePrivateJson } from "../utils/private-file.js";
 
 async function main(): Promise<void> {
 const config = loadConfig();
+const executablePath = config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+  || (await stat("/usr/bin/chromium").catch(() => null) ? "/usr/bin/chromium" : undefined);
 const profilePath = resolve(config.MERCADOLIVRE_WEB_PROFILE_PATH);
 const storagePath = resolve(config.MERCADOLIVRE_WEB_STORAGE_STATE_PATH);
 await mkdir(profilePath, { recursive: true, mode: 0o700 });
@@ -21,7 +23,7 @@ try {
     headless: false,
     locale: "pt-BR",
     timezoneId: "America/Sao_Paulo",
-    ...(config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ? { executablePath: config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } : {}),
+    ...(executablePath ? { executablePath } : {}),
   });
   const page = await context.newPage();
   await page.goto("https://lista.mercadolivre.com.br/notebook", { waitUntil: "domcontentloaded" });

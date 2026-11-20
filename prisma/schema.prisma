@@ -8,32 +8,57 @@ datasource db {
 }
 
 model Search {
-  id                String            @id @default(cuid())
-  name              String
-  query             String
-  category          String
-  minPrice          Decimal?          @db.Decimal(14, 2)
-  maxPrice          Decimal?          @db.Decimal(14, 2)
-  minYear           Int?
-  maxYear           Int?
-  location          String?
-  radiusKm          Int?
-  minimumScore      Int               @default(70)
-  intervalMinutes   Int               @default(60)
-  providers         String[]          @default([])
-  forbiddenWords    String[]          @default([])
-  active            Boolean           @default(true)
-  createdAt         DateTime          @default(now())
-  updatedAt         DateTime          @updatedAt
-  lastRunAt         DateTime?
-  runLeaseId        String?
-  runLeaseExpiresAt DateTime?
-  listings          SearchListing[]
-  analyses          ListingAnalysis[]
-  notifications     Notification[]
+  id                  String            @id @default(cuid())
+  name                String
+  query               String
+  category            String
+  minPrice            Decimal?          @db.Decimal(14, 2)
+  maxPrice            Decimal?          @db.Decimal(14, 2)
+  minYear             Int?
+  maxYear             Int?
+  location            String?
+  radiusKm            Int?
+  minimumScore        Int               @default(70)
+  intervalMinutes     Int               @default(60)
+  providers           String[]          @default([])
+  forbiddenWords      String[]          @default([])
+  active              Boolean           @default(true)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  lastRunAt           DateTime?
+  runLeaseId          String?
+  runLeaseExpiresAt   DateTime?
+  opportunitySettings Json?
+  listings            SearchListing[]
+  analyses            ListingAnalysis[]
+  notifications       Notification[]
+  runs                SearchRun[]
 
   @@index([active, lastRunAt])
   @@index([runLeaseExpiresAt])
+}
+
+enum SearchRunStatus {
+  running
+  success
+  partial
+  failed
+  interrupted
+}
+
+model SearchRun {
+  id          String          @id
+  searchId    String
+  startedAt   DateTime        @default(now())
+  finishedAt  DateTime?
+  status      SearchRunStatus
+  providers   Json
+  discovered Int             @default(0)
+  analyzed    Int             @default(0)
+  search      Search          @relation(fields: [searchId], references: [id], onDelete: Cascade)
+
+  @@index([searchId, startedAt])
+  @@index([startedAt])
 }
 
 model Listing {
@@ -80,15 +105,18 @@ model Listing {
 }
 
 model SearchListing {
-  searchId       String
-  listingId      String
-  firstMatchedAt DateTime @default(now())
-  lastMatchedAt  DateTime @default(now())
-  search         Search   @relation(fields: [searchId], references: [id], onDelete: Cascade)
-  listing        Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  searchId          String
+  listingId         String
+  firstMatchedAt    DateTime         @default(now())
+  lastMatchedAt     DateTime         @default(now())
+  currentAnalysisId String?
+  search            Search           @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  listing           Listing          @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  currentAnalysis   ListingAnalysis? @relation("CurrentSearchAnalysis", fields: [currentAnalysisId], references: [id], onDelete: SetNull)
 
   @@id([searchId, listingId])
   @@index([listingId])
+  @@index([currentAnalysisId])
 }
 
 model ListingPriceHistory {
@@ -128,11 +156,13 @@ model ListingAnalysis {
   reason                 String
   analysisModel          String?
   llmAttemptedAt         DateTime?
+  opportunity            Json?
   inputHash              String
   createdAt              DateTime       @default(now())
   listing                Listing        @relation(fields: [listingId], references: [id], onDelete: Cascade)
   search                 Search         @relation(fields: [searchId], references: [id], onDelete: Cascade)
   notifications          Notification[]
+  currentFor             SearchListing[] @relation("CurrentSearchAnalysis")
 
   @@unique([listingId, searchId, inputHash])
   @@index([listingId, searchId, createdAt])

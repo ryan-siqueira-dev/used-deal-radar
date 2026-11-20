@@ -1,4 +1,4 @@
-import type { MarketplaceName } from "../marketplaces/types.js";
+import { marketplaceNames, type MarketplaceName } from "../marketplaces/types.js";
 
 export type ReferenceConfidence = "low" | "medium" | "high";
 export interface MarketReference { sampleSize: number; confidence: ReferenceConfidence; medianPrice: number | null }
@@ -58,7 +58,7 @@ export function calculatePriceStatistics(values: readonly number[]): PriceStatis
 
 export function calculateMarketStatistics(listings: readonly PricedListing[]): MarketStatistics {
   const byProvider: Partial<Record<MarketplaceName, PriceStatistics>> = {};
-  for (const source of ["facebook", "olx", "mercadolivre"] as const) {
+  for (const source of marketplaceNames) {
     const prices = listings.filter((listing) => listing.source === source).map((listing) => listing.price);
     if (prices.length) byProvider[source] = calculatePriceStatistics(prices);
   }

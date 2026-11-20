@@ -14,7 +14,9 @@ const mocks = vi.hoisted(() => ({
   lockRow: vi.fn(),
   findStructured: vi.fn(),
   upsertStructured: vi.fn(),
+  retryDelay: vi.fn().mockResolvedValue(undefined),
 }));
+vi.mock("node:timers/promises", () => ({ setTimeout: mocks.retryDelay }));
 
 vi.mock("../src/db/client.js", () => {
   const transaction = {
@@ -75,6 +77,7 @@ function storedListing(change: Record<string, unknown> = {}) {
 describe("ListingRepository marketplace identity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.retryDelay.mockReset().mockResolvedValue(undefined);
     mocks.findUnique.mockResolvedValue(null);
     mocks.findFirst.mockResolvedValue(null);
     mocks.lockRow.mockResolvedValue([{ id: "listing-1" }]);
@@ -87,6 +90,23 @@ describe("ListingRepository marketplace identity", () => {
     mocks.createPrice.mockResolvedValue({});
     mocks.findStructured.mockResolvedValue(null);
     mocks.upsertStructured.mockResolvedValue({});
+  });
+
+  it("marks an unavailable offer inactive only if its identity has not changed", async () => {
+    const listing = storedListing();
+    mocks.findUnique.mockResolvedValue(listing);
+    await new ListingRepository().markUnavailable(listing.id, listingFenceFor(listing));
+    expect(mocks.updateListing).toHaveBeenCalledWith(expect.objectContaining({data: expect.objectContaining({active: false})}));
+    mocks.updateListing.mockClear();
+    await new ListingRepository().markUnavailable(listing.id, {...listingFenceFor(listing), fingerprint: "stale"});
+    expect(mocks.updateListing).not.toHaveBeenCalled();
+  });
+
+  it("refreshes details when a previously unavailable offer reappears", async () => {
+    const listing = storedListing({active:false});
+    mocks.findUnique.mockResolvedValue(listing);
+    const result = await new ListingRepository().upsertSummary("search-1", "gpu", listingFixture());
+    expect(result.needsDetails).toBe(true);
   });
 
   it("never attaches a summary without an external ID to an arbitrary explicit ID", async () => {
@@ -232,6 +252,8 @@ describe("ListingRepository marketplace identity", () => {
     const staleFence = {
       ...listingFenceFor(listing),
       updatedAt: new Date("2026-08-09T12:00:00.000Z"),
+      fingerprint: "prior-fingerprint",
+      contentHash: "prior-content",
     };
 
     await expect(new ListingRepository().updateDetails(
@@ -257,5 +279,36 @@ describe("ListingRepository marketplace identity", () => {
       where: { id: listing.id },
       data: { lastCheckedAt: expect.any(Date) },
     });
+  });
+
+  it("allows concurrent sightings of identical content without discarding another search", async () => {
+    const listing = storedListing({ contentHash: "same-content" });
+    const fence = listingFenceFor(listing);
+    mocks.findUnique.mockResolvedValue({ ...listing, updatedAt: new Date(listing.updatedAt.getTime() + 1_000) });
+    await expect(new ListingRepository().markDetailsChecked(listing.id, fence)).resolves.not.toBeNull();
+  });
+
+  it("rejects currency changes even when the numeric price and content hash are unchanged", async () => {
+    const listing = storedListing({ contentHash: "same-content", currency: "BRL" });
+    const fence = listingFenceFor(listing);
+    mocks.findUnique.mockResolvedValue({ ...listing, currency: "USD" });
+    await expect(new ListingRepository().markDetailsChecked(listing.id, fence)).resolves.toBeNull();
+  });
+
+  it.each([
+    { code: "P2034", meta: {} },
+    { code: "P2010", meta: { code: "40001" } },
+    { code: "P2010", meta: { code: "40P01" } },
+  ])("backs off for transaction conflicts $code $meta before retrying", async ({ code, meta }) => {
+    let release!: () => void;
+    mocks.retryDelay.mockReturnValue(new Promise<void>((resolve) => { release = resolve; }));
+    mocks.createListing.mockRejectedValueOnce(new Prisma.PrismaClientKnownRequestError("serialization conflict", {
+      code, meta, clientVersion: "test",
+    }));
+    const operation = new ListingRepository().upsertSummary("search-1", "generic", listingFixture());
+    await vi.waitFor(() => expect(mocks.retryDelay).toHaveBeenCalled());
+    expect(mocks.createListing).toHaveBeenCalledTimes(1);
+    release();
+    await expect(operation).resolves.toMatchObject({ isNew: true });
   });
 });

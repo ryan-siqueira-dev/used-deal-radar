@@ -1,13 +1,16 @@
 import { Prisma, type Listing, type ListingAnalysis, type Search } from "@prisma/client";
+import { setTimeout as delay } from "node:timers/promises";
 import type { ListingCategory, StructuredListing } from "../categories/types.js";
 import type { DealAnalysis } from "../llm/types.js";
 import type { ListingDetails, ListingSummary, MarketplaceName } from "../marketplaces/types.js";
 import type { MarketStatistics } from "../market-analysis/statistics.js";
 import type { DeterministicScoreResult } from "../scoring/hybrid.js";
-import { listingContentHash, listingFingerprint } from "../utils/hash.js";
+import { listingContentHash, listingFingerprint, stableStringify } from "../utils/hash.js";
 import { normalizeUrl } from "../utils/normalization.js";
 import { prisma } from "../db/client.js";
 import { sanitizeLogText } from "../config/logger.js";
+import type { OpportunityEvaluation } from "../opportunities/evaluation.js";
+import { searchCriteriaSnapshot } from "../searches/snapshot.js";
 
 function toJson(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
@@ -22,6 +25,12 @@ function notificationErrorMessage(error: unknown): string {
   return sanitizeLogText(message).slice(0, 2_000);
 }
 
+function isTransactionConflict(error: unknown): boolean {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) return false;
+  return error.code === "P2002" || error.code === "P2034"
+    || (error.code === "P2010" && ["40001", "40P01"].includes(String(error.meta?.["code"])));
+}
+
 export interface UpsertSummaryResult {
   listing: Listing;
   isNew: boolean;
@@ -34,8 +43,12 @@ export interface ListingFence {
   updatedAt: Date;
   fingerprint: string;
   contentHash: string | null;
+  currency?: string | null;
+  normalizedUrl?: string;
+  category?: string;
+  active?: boolean;
 }
-export interface ComparableRecord { id: string; source: MarketplaceName; title: string; location: string | null; price: number; structured: StructuredListing }
+export interface ComparableRecord { id: string; source: MarketplaceName; title: string; location: string | null; price: number; structured: StructuredListing; sellerName?: string | null; imageUrl?: string | null }
 export interface StoredExtractions {
   enriched: StructuredListing;
   deterministic: StructuredListing;
@@ -50,6 +63,8 @@ export interface ClaimNotificationInput {
   listingFence: ListingFence;
   leaseMs?: number;
   now?: Date;
+  searchCriteria?: Record<string, unknown>;
+  runLeaseId?: string;
 }
 export interface NotificationClaim {
   id: string;
@@ -61,27 +76,34 @@ export interface NotificationClaim {
   attempt: number;
 }
 
-export function listingFenceFor(listing: Pick<Listing, "updatedAt" | "fingerprint" | "contentHash">): ListingFence {
+export function listingFenceFor(listing: Pick<Listing, "updatedAt" | "fingerprint" | "contentHash"> & Partial<Pick<Listing, "currency" | "normalizedUrl" | "category" | "active">>): ListingFence {
   return {
     updatedAt: new Date(listing.updatedAt.getTime()),
     fingerprint: listing.fingerprint,
     contentHash: listing.contentHash,
+    ...(listing.currency !== undefined ? { currency: listing.currency } : {}),
+    ...(listing.normalizedUrl !== undefined ? { normalizedUrl: listing.normalizedUrl } : {}),
+    ...(listing.category !== undefined ? { category: listing.category } : {}),
+    ...(listing.active !== undefined ? { active: listing.active } : {}),
   };
 }
 
 function matchesListingFence(
-  listing: Pick<Listing, "updatedAt" | "fingerprint" | "contentHash">,
+  listing: Listing,
   expected: ListingFence,
 ): boolean {
-  return listing.updatedAt.getTime() === expected.updatedAt.getTime()
-    && listing.fingerprint === expected.fingerprint
-    && listing.contentHash === expected.contentHash;
+  return listing.fingerprint === expected.fingerprint
+    && listing.contentHash === expected.contentHash
+    && (expected.currency === undefined || listing.currency === expected.currency)
+    && (expected.normalizedUrl === undefined || listing.normalizedUrl === expected.normalizedUrl)
+    && (expected.category === undefined || listing.category === expected.category)
+    && (expected.active === undefined || listing.active === expected.active);
 }
 
 export class ListingRepository {
   async upsertSummary(searchId: string, category: ListingCategory, summary: ListingSummary): Promise<UpsertSummaryResult> {
     const normalizedUrl = normalizeUrl(summary.url);
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
         return await prisma.$transaction(async (transaction) => {
           let existing = await this.findExisting(transaction, summary.source, summary.externalId, normalizedUrl);
@@ -166,13 +188,14 @@ export class ListingRepository {
             isNew: !existing,
             priceChanged,
             contentChanged,
-            needsDetails: !existing || existing.lastCheckedAt < refreshBefore || contentChanged,
+            needsDetails: !existing || !existing.active || existing.lastCheckedAt < refreshBefore || contentChanged,
             suppressed: false,
           };
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
       } catch (error) {
-        const conflict = error instanceof Prisma.PrismaClientKnownRequestError && (error.code === "P2002" || error.code === "P2034");
-        if (!conflict || attempt === 3) throw error;
+        const conflict = isTransactionConflict(error);
+        if (!conflict || attempt === 5) throw error;
+        await delay(25 * 2 ** attempt);
       }
     }
     throw new Error("listing_upsert_failed");
@@ -185,11 +208,17 @@ export class ListingRepository {
     expectedFence: ListingFence,
   ): Promise<{ listing: Listing; contentChanged: boolean } | null> {
     const contentHash = listingContentHash(details);
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
         return await prisma.$transaction(async (transaction) => {
           const existing = await this.lockListing(transaction, id);
-          if (!existing || existing.suppressedAt || !matchesListingFence(existing, expectedFence)) return null;
+          if (!existing || existing.suppressedAt) return null;
+          if (!matchesListingFence(existing, expectedFence)) {
+            const sameDetails = existing.contentHash === contentHash && existing.currency === details.currency
+              && existing.location === details.location && existing.normalizedUrl === normalizeUrl(details.url)
+              && existing.category === category && existing.active;
+            return sameDetails ? { listing: existing, contentChanged: false } : null;
+          }
           const listing = await transaction.listing.update({
             where: { id },
             data: {
@@ -218,15 +247,33 @@ export class ListingRepository {
           return { listing, contentChanged: existing.contentHash !== contentHash };
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
       } catch (error) {
-        const conflict = error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034";
-        if (!conflict || attempt === 3) throw error;
+        const conflict = isTransactionConflict(error);
+        if (!conflict || attempt === 5) throw error;
+        await delay(25 * 2 ** attempt);
       }
     }
     throw new Error("listing_details_update_failed");
   }
 
+  async markUnavailable(id: string, expectedFence: ListingFence): Promise<Listing | null> {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      try {
+        return await prisma.$transaction(async (transaction) => {
+          const listing = await this.lockListing(transaction, id);
+          if (!listing || listing.suppressedAt || !matchesListingFence(listing, expectedFence)) return null;
+          return transaction.listing.update({ where: { id }, data: { active: false, lastCheckedAt: new Date() } });
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+      } catch (error) {
+        const conflict = isTransactionConflict(error);
+        if (!conflict || attempt === 5) throw error;
+        await delay(25 * 2 ** attempt);
+      }
+    }
+    throw new Error("listing_unavailable_update_failed");
+  }
+
   async markDetailsChecked(id: string, expectedFence: ListingFence): Promise<Listing | null> {
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
         return await prisma.$transaction(async (transaction) => {
           const listing = await this.lockListing(transaction, id);
@@ -234,8 +281,9 @@ export class ListingRepository {
           return transaction.listing.update({ where: { id }, data: { lastCheckedAt: new Date() } });
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
       } catch (error) {
-        const conflict = error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034";
-        if (!conflict || attempt === 3) throw error;
+        const conflict = isTransactionConflict(error);
+        if (!conflict || attempt === 5) throw error;
+        await delay(25 * 2 ** attempt);
       }
     }
     throw new Error("listing_details_check_failed");
@@ -261,7 +309,7 @@ export class ListingRepository {
       extractionAttemptedAt: extractionAttemptedAt?.toISOString() ?? null,
       sourceContentHash,
     });
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
         return await prisma.$transaction(async (transaction) => {
           let dataToPersist = data;
@@ -291,8 +339,9 @@ export class ListingRepository {
           return persistedListing;
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
       } catch (error) {
-        const conflict = error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034";
-        if (!conflict || attempt === 3) throw error;
+        const conflict = isTransactionConflict(error);
+        if (!conflict || attempt === 5) throw error;
+        await delay(25 * 2 ** attempt);
       }
     }
     throw new Error("structured_listing_save_failed");
@@ -369,6 +418,43 @@ export class ListingRepository {
     return rows.map((row) => ({ price: row.price.toNumber(), observedAt: row.observedAt }));
   }
 
+  async findUsedComparables(
+    category: ListingCategory,
+    excludeId: string,
+    seenAfter: Date,
+    currency: string | null,
+    extractComparable: (listing: ListingDetails) => Promise<StructuredListing | null>,
+  ): Promise<ComparableRecord[]> {
+    if (!currency) return [];
+    const comparable: ComparableRecord[] = [];
+    let cursor: string | undefined;
+    // Filter by equivalence before taking a sample. A busy generic category must
+    // not hide relevant older ads behind a global latest-250 cutoff.
+    while (true) {
+      const rows = await prisma.listing.findMany({
+        where: {
+          id: { not: excludeId }, category, source: { in: ["olx", "facebook", "mercadolivre"] },
+          active: true, suppressedAt: null, lastSeenAt: { gte: seenAfter },
+          price: { gt: 0 }, currency,
+        },
+        orderBy: { id: "asc" },
+        take: 250,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      });
+      for (const row of rows) {
+        const structured = await extractComparable(this.toDetails(row));
+        if (!structured || !row.price) continue;
+        comparable.push({
+          id: row.id, source: row.source as MarketplaceName, title: row.title,
+          location: row.location, price: row.price.toNumber(), structured,
+          sellerName: row.sellerName, imageUrl: row.imageUrl,
+        });
+      }
+      if (rows.length < 250) return comparable;
+      cursor = rows.at(-1)?.id;
+    }
+  }
+
   async findAnalysis(listingId: string, searchId: string, inputHash: string) {
     return prisma.listingAnalysis.findFirst({ where: { listingId, searchId, inputHash }, orderBy: { createdAt: "desc" } });
   }
@@ -388,6 +474,7 @@ export class ListingRepository {
     analysisModel: string | null;
     llmAttempted: boolean;
     inputHash: string;
+    opportunity?: OpportunityEvaluation;
   }): Promise<ListingAnalysis | null> {
     const llmAttemptedAt = input.llmAttempted ? new Date() : null;
     const analysisData = {
@@ -402,13 +489,14 @@ export class ListingRepository {
       reason: input.analysis.reason,
       analysisModel: input.analysisModel,
       llmAttemptedAt,
+      ...(input.opportunity ? { opportunity: toJson(input.opportunity) } : {}),
     };
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
         return await prisma.$transaction(async (transaction) => {
           const listing = await this.lockListing(transaction, input.listingId);
           if (!listing || listing.suppressedAt || !matchesListingFence(listing, input.listingFence)) return null;
-          return transaction.listingAnalysis.upsert({
+          const analysis = await transaction.listingAnalysis.upsert({
             where: { listingId_searchId_inputHash: { listingId: input.listingId, searchId: input.searchId, inputHash: input.inputHash } },
             update: input.analysisModel ? analysisData : input.llmAttempted ? { llmAttemptedAt } : {},
             create: {
@@ -418,13 +506,33 @@ export class ListingRepository {
               inputHash: input.inputHash,
             },
           });
+          if (input.opportunity) {
+            await transaction.searchListing.updateMany({
+              where: { searchId: input.searchId, listingId: input.listingId },
+              data: { currentAnalysisId: analysis.id },
+            });
+          }
+          return analysis;
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
       } catch (error) {
-        const conflict = error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034";
-        if (!conflict || attempt === 3) throw error;
+        const conflict = isTransactionConflict(error);
+        if (!conflict || attempt === 5) throw error;
+        await delay(25 * 2 ** attempt);
       }
     }
     throw new Error("listing_analysis_save_failed");
+  }
+
+  async setCurrentAnalysis(searchId: string, listingId: string, analysisId: string, expectedFence: ListingFence): Promise<void> {
+    await prisma.$transaction(async (transaction) => {
+      const listing = await this.lockListing(transaction, listingId);
+      if (!listing || listing.suppressedAt || !matchesListingFence(listing, expectedFence)) return;
+      const analysis = await transaction.listingAnalysis.findFirst({ where: { id: analysisId, searchId, listingId } });
+      if (!analysis) return;
+      await transaction.searchListing.updateMany({
+        where: { searchId, listingId }, data: { currentAnalysisId: analysisId },
+      });
+    });
   }
 
   async claimNotification(input: ClaimNotificationInput): Promise<NotificationClaim | null> {
@@ -442,6 +550,13 @@ export class ListingRepository {
       });
       const listing = await this.lockListing(transaction, analysis.listingId);
       if (!listing || listing.suppressedAt || !matchesListingFence(listing, input.listingFence)) return null;
+      if (input.searchCriteria) {
+        await transaction.$queryRaw(Prisma.sql`SELECT "id" FROM "Search" WHERE "id" = ${analysis.searchId} FOR UPDATE`);
+        const search = await transaction.search.findUnique({ where: { id: analysis.searchId } });
+        if (!search?.active || search.opportunitySettings !== null
+          || (input.runLeaseId && (search.runLeaseId !== input.runLeaseId || !search.runLeaseExpiresAt || search.runLeaseExpiresAt <= claimedAt))
+          || stableStringify(searchCriteriaSnapshot(search)) !== stableStringify(input.searchCriteria)) return null;
+      }
       const notification = await transaction.notification.upsert({
         where: { analysisId_channel: { analysisId: input.analysisId, channel } },
         create: {
