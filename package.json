@@ -51,7 +51,7 @@
     "prisma": "6.19.3",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^24.3.1",
@@ -63,5 +63,12 @@
     "typescript": "^5.9.2",
     "vite": "^7.3.7",
     "vitest": "^3.2.7"
+  },
+  "overrides": {
+    "@prisma/config": {
+      "deepmerge-ts": "8.0.2",
+      "effect": "3.22.5"
+    },
+    "source-map-js": "^1.2.4"
   }
 }

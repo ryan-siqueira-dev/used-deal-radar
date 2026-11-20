@@ -7,7 +7,7 @@ export type ListingCategory = z.infer<typeof listingCategorySchema>;
 
 export const structuredListingSchema = z.object({
   category: listingCategorySchema,
-  data: z.record(z.unknown()),
+  data: z.record(z.string(), z.unknown()),
   extractionConfidence: z.number().min(0).max(1),
 });
 export type StructuredListing = z.infer<typeof structuredListingSchema>;

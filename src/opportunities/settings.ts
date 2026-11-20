@@ -19,7 +19,7 @@ export const usedSearchSettingsSchema = z.object({
   minimumComparables: z.number().int().min(5).safe().default(usedSearchDefaults.minimumComparables),
   facebookLocation: z.string().trim().min(1).max(200).default(usedSearchDefaults.facebookLocation),
   facebookRadiusKm: z.number().int().positive().max(2_000).default(usedSearchDefaults.facebookRadiusKm),
-  costs: costs.default({}),
+  costs: costs.prefault({}),
 }).strict();
 
 export type UsedSearchSettings = z.infer<typeof usedSearchSettingsSchema>;

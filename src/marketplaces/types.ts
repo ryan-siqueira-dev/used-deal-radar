@@ -60,7 +60,7 @@ export const listingDetailsSchema = listingSummarySchema.extend({
   description: z.string().max(100_000).nullable(),
   sellerName: z.string().trim().max(500).nullable(),
   images: z.array(httpUrlSchema).max(50),
-  attributes: z.record(z.unknown()).refine((value) => Object.keys(value).length <= 200, "too many attributes"),
+  attributes: z.record(z.string(), z.unknown()).refine((value) => Object.keys(value).length <= 200, "too many attributes"),
   publishedAt: z.date().nullable().optional(),
   rawData: z.unknown().optional(),
 });

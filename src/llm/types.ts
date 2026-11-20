@@ -10,7 +10,7 @@ export interface ListingExtractionInput {
 }
 
 export const extractedListingDataSchema = z.object({
-  data: z.record(z.unknown()),
+  data: z.record(z.string(), z.unknown()),
   confidence: z.number().min(0).max(1),
 });
 export type ExtractedListingData = z.infer<typeof extractedListingDataSchema>;
