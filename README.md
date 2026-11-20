@@ -1,6 +1,6 @@
-# AI Deal Finder
+# Used Deal Radar
 
-Serviço self-hosted em Node.js e TypeScript para experimentar descoberta autorizada de anúncios, histórico de preços e ranqueamento de oportunidades com regras determinísticas, estatística e integração opcional com LLM e Telegram.
+Local app for discovering used-item deals on OLX, Facebook Marketplace, and Mercado Livre, with price comparisons, price history, and buying or resale analysis.
 
 > [!IMPORTANT]
 > Este é um projeto independente de portfólio. Ele não é afiliado, patrocinado nem aprovado por Meta/Facebook, OLX ou Mercado Livre. Uma conta válida, um token ou uma sessão autenticada não constituem autorização para coleta automatizada.
@@ -27,7 +27,7 @@ O projeto foi desenhado para uso pessoal, autorizado e de baixo volume. Não imp
 
 ## Proposta e escopo
 
-O AI Deal Finder demonstra como organizar um pipeline de dados resiliente para:
+O Used Deal Radar demonstra como organizar um pipeline de dados resiliente para:
 
 - executar pesquisas manuais ou agendadas;
 - receber resultados de adapters de marketplace substituíveis;

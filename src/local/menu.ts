@@ -48,7 +48,7 @@ export async function runLocalMenu(controller: MenuController, input: Readable, 
   process.on("SIGTERM", handleTermination);
 
   try {
-    output.write("AI Deal Finder local\n");
+    output.write("Used Deal Radar local\n");
 
     while (!closed.signal.aborted) {
       try {

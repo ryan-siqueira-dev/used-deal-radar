@@ -235,7 +235,7 @@ function App() {
     <div className="shell">
       <header>
         <div className="header-inner">
-          <div className="brand"><span className="brand-mark" aria-hidden="true">◈</span><strong>Radar de usados</strong></div>
+          <div className="brand"><span className="brand-mark" aria-hidden="true">◈</span><strong>Used Deal Radar</strong></div>
           <div className="actions">
             <button type="button" className="text" onClick={refresh}>Atualizar</button>
             <button type="button" onClick={() => openEditor(null)}>Nova pesquisa</button>

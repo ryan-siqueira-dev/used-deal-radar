@@ -1,9 +1,9 @@
 {
-  "name": "ai-deal-finder",
+  "name": "used-deal-radar",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Self-hosted multi-marketplace deal discovery and analysis service",
+  "description": "Local app for discovering used-item deals on OLX, Facebook Marketplace, and Mercado Livre, with price comparisons, price history, and buying or resale analysis.",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
